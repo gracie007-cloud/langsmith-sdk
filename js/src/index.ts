@@ -10,6 +10,7 @@ export type {
   TracerSession,
   Run,
   Feedback,
+  FeedbackConfigSchema,
   RetrieverOutput,
 } from "./schemas.js";
 
@@ -23,9 +24,12 @@ export { uuid7, uuid7FromTime } from "./uuid.js";
 
 export {
   Cache,
+  PromptCache,
   type CacheConfig,
   type CacheMetrics,
-} from "./utils/prompts_cache.js";
+  configureGlobalPromptCache,
+  promptCacheSingleton,
+} from "./utils/prompt_cache/index.js";
 
 // Update using yarn bump-version
-export const __version__ = "0.4.12";
+export const __version__ = "0.5.8";

@@ -2,13 +2,18 @@
 
 from langsmith.sandbox import (
     QuotaExceededError,
+    ResourceCreationError,
     ResourceNameConflictError,
     ResourceNotFoundError,
     ResourceTimeoutError,
     SandboxClientError,
-    SandboxCreationError,
     SandboxOperationError,
     ValidationError,
+)
+from langsmith.sandbox._exceptions import (
+    CommandTimeoutError,
+    SandboxConnectionError,
+    SandboxServerReloadError,
 )
 from langsmith.utils import LangSmithError
 
@@ -103,20 +108,31 @@ class TestQuotaExceededError:
         assert error.quota_type == "sandbox_count"
 
 
-class TestSandboxCreationError:
-    """Tests for SandboxCreationError."""
+class TestResourceCreationError:
+    """Tests for ResourceCreationError."""
 
     def test_basic_message(self):
         """Test basic error message."""
-        error = SandboxCreationError("Failed to create sandbox")
+        error = ResourceCreationError("Failed to create sandbox")
         assert str(error) == "Failed to create sandbox"
         assert error.error_type is None
+        assert error.resource_type is None
 
     def test_with_error_type(self):
         """Test error with error_type."""
-        error = SandboxCreationError("Image pull failed", error_type="ImagePull")
+        error = ResourceCreationError("Image pull failed", error_type="ImagePull")
         assert "[ImagePull]" in str(error)
         assert error.error_type == "ImagePull"
+
+    def test_with_resource_type(self):
+        """Test error with resource_type."""
+        error = ResourceCreationError(
+            "Provisioning failed",
+            resource_type="volume",
+            error_type="VolumeProvisioning",
+        )
+        assert error.resource_type == "volume"
+        assert error.error_type == "VolumeProvisioning"
 
 
 class TestSandboxOperationError:
@@ -155,3 +171,28 @@ class TestResourceNameConflictError:
         """Test error with resource_type."""
         error = ResourceNameConflictError("Name already exists", resource_type="volume")
         assert error.resource_type == "volume"
+
+
+class TestCommandTimeoutError:
+    """Tests for CommandTimeoutError."""
+
+    def test_is_sandbox_operation_error(self):
+        assert issubclass(CommandTimeoutError, SandboxOperationError)
+
+    def test_attributes(self):
+        err = CommandTimeoutError("timed out", timeout=60)
+        assert err.timeout == 60
+        assert err.operation == "command"
+        assert err.error_type == "CommandTimeout"
+
+
+class TestSandboxServerReloadError:
+    """Tests for SandboxServerReloadError."""
+
+    def test_is_connection_error(self):
+        assert issubclass(SandboxServerReloadError, SandboxConnectionError)
+
+    def test_isinstance_check(self):
+        """SandboxServerReloadError is caught by except SandboxConnectionError."""
+        err = SandboxServerReloadError("reloading")
+        assert isinstance(err, SandboxConnectionError)

@@ -44,6 +44,24 @@ class SandboxConnectionError(SandboxClientError):
     pass
 
 
+class SandboxServerReloadError(SandboxConnectionError):
+    """Raised when the server sends a 1001 Going Away close frame.
+
+    This indicates a server hot-reload, not a true connection failure.
+    The command is still running on the server.
+
+    This is a subclass of SandboxConnectionError, so the auto-reconnect
+    logic in CommandHandle catches it along with all other
+    connection errors. The distinction matters for retry strategy:
+    SandboxServerReloadError triggers immediate reconnect (no backoff),
+    while other SandboxConnectionError triggers exponential backoff.
+
+    Users typically never see this exception — it's handled internally.
+    """
+
+    pass
+
+
 # =============================================================================
 # Resource Errors (type-based, with resource_type attribute)
 # =============================================================================
@@ -178,21 +196,28 @@ class QuotaExceededError(SandboxClientError):
 
 
 # =============================================================================
-# Sandbox Creation Errors
+# Resource Creation Errors
 # =============================================================================
 
 
-class SandboxCreationError(SandboxClientError):
-    """Raised when sandbox creation fails.
+class ResourceCreationError(SandboxClientError):
+    """Raised when resource provisioning fails.
 
     Attributes:
+        resource_type: Type of resource (sandbox, volume, pool).
         error_type: Machine-readable error type (ImagePull, CrashLoop,
-            SandboxConfig, Unschedulable).
+            SandboxConfig, Unschedulable, VolumeProvisioning).
     """
 
-    def __init__(self, message: str, error_type: Optional[str] = None):
+    def __init__(
+        self,
+        message: str,
+        resource_type: Optional[str] = None,
+        error_type: Optional[str] = None,
+    ):
         """Initialize the error."""
         super().__init__(message)
+        self.resource_type = resource_type
         self.error_type = error_type
 
     def __str__(self) -> str:
@@ -246,3 +271,16 @@ class SandboxOperationError(SandboxClientError):
         if self.error_type:
             return f"{super().__str__()} [{self.error_type}]"
         return super().__str__()
+
+
+class CommandTimeoutError(SandboxOperationError):
+    """Raised when a command exceeds its timeout.
+
+    Attributes:
+        timeout: The timeout value in seconds that was exceeded.
+    """
+
+    def __init__(self, message: str, timeout: Optional[int] = None):
+        """Initialize the error."""
+        super().__init__(message, operation="command", error_type="CommandTimeout")
+        self.timeout = timeout

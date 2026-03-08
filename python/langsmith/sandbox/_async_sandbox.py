@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, overload
 
 import httpx
 
@@ -11,9 +11,13 @@ from langsmith.sandbox._exceptions import (
     DataplaneNotConfiguredError,
     ResourceNotFoundError,
     SandboxConnectionError,
+    SandboxNotReadyError,
 )
 from langsmith.sandbox._helpers import handle_sandbox_http_error
-from langsmith.sandbox._models import ExecutionResult
+from langsmith.sandbox._models import (
+    AsyncCommandHandle,
+    ExecutionResult,
+)
 
 if TYPE_CHECKING:
     from langsmith.sandbox._async_client import AsyncSandboxClient
@@ -30,8 +34,11 @@ class AsyncSandbox:
         name: Display name (can be updated).
         template_name: Name of the template used to create this sandbox.
         dataplane_url: URL for data plane operations (file I/O, command execution).
+            Only functional when status is "ready".
         id: Unique identifier (UUID). Remains constant even if name changes.
             May be None for resources created before ID support was added.
+        status: Sandbox lifecycle status. One of "provisioning", "ready", "failed".
+        status_message: Human-readable details when status is "failed", None otherwise.
         created_at: Timestamp when the sandbox was created.
         updated_at: Timestamp when the sandbox was last updated.
 
@@ -46,6 +53,8 @@ class AsyncSandbox:
     template_name: str
     dataplane_url: Optional[str] = None
     id: Optional[str] = None
+    status: str = "ready"
+    status_message: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -75,6 +84,8 @@ class AsyncSandbox:
             template_name=data.get("template_name", ""),
             dataplane_url=data.get("dataplane_url"),
             id=data.get("id"),
+            status=data.get("status", "ready"),
+            status_message=data.get("status_message"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
             _client=client,
@@ -106,14 +117,48 @@ class AsyncSandbox:
             The dataplane URL.
 
         Raises:
+            SandboxNotReadyError: If sandbox status is not "ready".
             DataplaneNotConfiguredError: If dataplane_url is not configured.
         """
+        if self.status != "ready":
+            raise SandboxNotReadyError(
+                f"Sandbox '{self.name}' is not ready (status: {self.status}). "
+                "Wait for status 'ready' before running operations."
+            )
         if not self.dataplane_url:
             raise DataplaneNotConfiguredError(
                 f"Sandbox '{self.name}' does not have a dataplane_url configured. "
                 "Runtime operations require a dataplane URL."
             )
         return self.dataplane_url
+
+    @overload
+    async def run(
+        self,
+        command: str,
+        *,
+        timeout: int = ...,
+        env: Optional[dict[str, str]] = ...,
+        cwd: Optional[str] = ...,
+        shell: str = ...,
+        on_stdout: Optional[Callable[[str], Any]] = ...,
+        on_stderr: Optional[Callable[[str], Any]] = ...,
+        wait: Literal[True] = ...,
+    ) -> ExecutionResult: ...
+
+    @overload
+    async def run(
+        self,
+        command: str,
+        *,
+        timeout: int = ...,
+        env: Optional[dict[str, str]] = ...,
+        cwd: Optional[str] = ...,
+        shell: str = ...,
+        on_stdout: Optional[Callable[[str], Any]] = ...,
+        on_stderr: Optional[Callable[[str], Any]] = ...,
+        wait: Literal[False],
+    ) -> AsyncCommandHandle: ...
 
     async def run(
         self,
@@ -123,7 +168,10 @@ class AsyncSandbox:
         env: Optional[dict[str, str]] = None,
         cwd: Optional[str] = None,
         shell: str = "/bin/bash",
-    ) -> ExecutionResult:
+        on_stdout: Optional[Callable[[str], Any]] = None,
+        on_stderr: Optional[Callable[[str], Any]] = None,
+        wait: bool = True,
+    ) -> Union[ExecutionResult, AsyncCommandHandle]:
         """Execute a command in the sandbox asynchronously.
 
         Args:
@@ -132,17 +180,122 @@ class AsyncSandbox:
             env: Environment variables to set for the command.
             cwd: Working directory for command execution. If None, uses sandbox default.
             shell: Shell to use for command execution. Defaults to "/bin/bash".
+            on_stdout: Callback invoked with each stdout chunk as it arrives.
+                Blocks until the command completes and returns ExecutionResult.
+                Cannot be combined with wait=False.
+            on_stderr: Callback invoked with each stderr chunk as it arrives.
+                Blocks until the command completes and returns ExecutionResult.
+                Cannot be combined with wait=False.
+            wait: If True (default), block until the command completes and
+                return ExecutionResult. If False, return an
+                AsyncCommandHandle immediately for streaming output,
+                kill, stdin input, and reconnection. Cannot be combined
+                with on_stdout/on_stderr callbacks.
 
         Returns:
-            ExecutionResult with stdout, stderr, and exit_code.
+            ExecutionResult when wait=True (default).
+            AsyncCommandHandle when wait=False.
 
         Raises:
+            ValueError: If wait=False is combined with callbacks.
             DataplaneNotConfiguredError: If dataplane_url is not configured.
             SandboxOperationError: If command execution fails.
-            SandboxConnectionError: If connection to sandbox fails.
+            CommandTimeoutError: If command exceeds its timeout.
+            SandboxConnectionError: If connection to sandbox fails after retries.
             SandboxNotReadyError: If sandbox is not ready.
             SandboxClientError: For other errors.
         """
+        if not wait and (on_stdout or on_stderr):
+            raise ValueError(
+                "Cannot combine wait=False with on_stdout/on_stderr callbacks. "
+                "Use wait=False and iterate the CommandHandle, or use callbacks."
+            )
+
+        self._require_dataplane_url()
+
+        use_ws = not wait or on_stdout or on_stderr
+        if use_ws:
+            return await self._run_ws(
+                command,
+                timeout=timeout,
+                env=env,
+                cwd=cwd,
+                shell=shell,
+                wait=wait,
+                on_stdout=on_stdout,
+                on_stderr=on_stderr,
+            )
+
+        # Catch broad exceptions so that unexpected WS failures (e.g. version
+        # incompatibilities) don't break users who don't need WS features.
+        try:
+            return await self._run_ws(
+                command,
+                timeout=timeout,
+                env=env,
+                cwd=cwd,
+                shell=shell,
+                wait=True,
+                on_stdout=None,
+                on_stderr=None,
+            )
+        except (SandboxConnectionError, ImportError, OSError, TypeError):
+            return await self._run_http(
+                command,
+                timeout=timeout,
+                env=env,
+                cwd=cwd,
+                shell=shell,
+            )
+
+    async def _run_ws(
+        self,
+        command: str,
+        *,
+        timeout: int,
+        env: Optional[dict[str, str]],
+        cwd: Optional[str],
+        shell: str,
+        wait: bool,
+        on_stdout: Optional[Callable[[str], Any]],
+        on_stderr: Optional[Callable[[str], Any]],
+    ) -> Union[ExecutionResult, AsyncCommandHandle]:
+        """Execute via WebSocket /execute/ws."""
+        from langsmith.sandbox._ws_execute import run_ws_stream_async
+
+        dataplane_url = self._require_dataplane_url()
+        api_key = self._client._api_key
+
+        msg_stream, control = await run_ws_stream_async(
+            dataplane_url,
+            api_key,
+            command,
+            timeout=timeout,
+            env=env,
+            cwd=cwd,
+            shell=shell,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+        )
+
+        handle = AsyncCommandHandle(msg_stream, control, self)
+        await handle._ensure_started()
+
+        if not wait:
+            return handle
+
+        return await handle.result
+
+    async def _run_http(
+        self,
+        command: str,
+        *,
+        timeout: int,
+        env: Optional[dict[str, str]],
+        cwd: Optional[str],
+        shell: str,
+    ) -> ExecutionResult:
+        """Execute via HTTP POST /execute (existing implementation)."""
         dataplane_url = self._require_dataplane_url()
         url = f"{dataplane_url}/execute"
         payload: dict[str, Any] = {
@@ -166,14 +319,55 @@ class AsyncSandbox:
                 stderr=data.get("stderr", ""),
                 exit_code=data.get("exit_code", -1),
             )
-        except httpx.ConnectError as e:
-            raise SandboxConnectionError(
-                f"Failed to connect to sandbox '{self.name}': {e}"
-            ) from e
         except httpx.HTTPStatusError as e:
             handle_sandbox_http_error(e)
-            # This line should never be reached but satisfies type checker
             raise  # pragma: no cover
+
+    async def reconnect(
+        self,
+        command_id: str,
+        *,
+        stdout_offset: int = 0,
+        stderr_offset: int = 0,
+    ) -> AsyncCommandHandle:
+        """Reconnect to a running or recently-finished command.
+
+        Resumes output from the given byte offsets. Any output produced while
+        the client was disconnected is replayed from the server's ring buffer.
+
+        Args:
+            command_id: The command ID from handle.command_id.
+            stdout_offset: Byte offset to resume stdout from (default: 0).
+            stderr_offset: Byte offset to resume stderr from (default: 0).
+
+        Returns:
+            An AsyncCommandHandle for the command.
+
+        Raises:
+            SandboxOperationError: If command_id is not found or session expired.
+            SandboxConnectionError: If connection to sandbox fails after retries.
+        """
+        from langsmith.sandbox._ws_execute import reconnect_ws_stream_async
+
+        dataplane_url = self._require_dataplane_url()
+        api_key = self._client._api_key
+
+        msg_stream, control = await reconnect_ws_stream_async(
+            dataplane_url,
+            api_key,
+            command_id,
+            stdout_offset=stdout_offset,
+            stderr_offset=stderr_offset,
+        )
+
+        return AsyncCommandHandle(
+            msg_stream,
+            control,
+            self,
+            command_id=command_id,
+            stdout_offset=stdout_offset,
+            stderr_offset=stderr_offset,
+        )
 
     async def write(
         self,
@@ -192,7 +386,7 @@ class AsyncSandbox:
         Raises:
             DataplaneNotConfiguredError: If dataplane_url is not configured.
             SandboxOperationError: If file write fails.
-            SandboxConnectionError: If connection to sandbox fails.
+            SandboxConnectionError: If connection to sandbox fails after retries.
             SandboxNotReadyError: If sandbox is not ready.
             SandboxClientError: For other errors.
         """
@@ -210,10 +404,6 @@ class AsyncSandbox:
                 url, params={"path": path}, files=files, timeout=timeout
             )
             response.raise_for_status()
-        except httpx.ConnectError as e:
-            raise SandboxConnectionError(
-                f"Failed to connect to sandbox '{self.name}': {e}"
-            ) from e
         except httpx.HTTPStatusError as e:
             handle_sandbox_http_error(e)
 
@@ -232,7 +422,7 @@ class AsyncSandbox:
             DataplaneNotConfiguredError: If dataplane_url is not configured.
             ResourceNotFoundError: If the file doesn't exist.
             SandboxOperationError: If file read fails.
-            SandboxConnectionError: If connection to sandbox fails.
+            SandboxConnectionError: If connection to sandbox fails after retries.
             SandboxNotReadyError: If sandbox is not ready.
             SandboxClientError: For other errors.
         """
@@ -245,10 +435,6 @@ class AsyncSandbox:
             )
             response.raise_for_status()
             return response.content
-        except httpx.ConnectError as e:
-            raise SandboxConnectionError(
-                f"Failed to connect to sandbox '{self.name}': {e}"
-            ) from e
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 raise ResourceNotFoundError(

@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import gc
 import inspect
 import json
 import os
@@ -7,6 +8,7 @@ import sys
 import time
 import uuid
 import warnings
+import weakref
 from typing import (
     Any,
     AsyncGenerator,
@@ -31,6 +33,8 @@ from langsmith import schemas as ls_schemas
 from langsmith import utils as ls_utils
 from langsmith._internal import _aiter as aitertools
 from langsmith.run_helpers import (
+    _attachment_args_cache,
+    _cached_attachment_args,
     _get_inputs,
     _get_inputs_and_attachments_safe,
     as_runnable,
@@ -231,6 +235,10 @@ def test__get_inputs_misnamed_and_required_keyword_only_args() -> None:
 
 
 def _get_mock_client(**kwargs: Any) -> Client:
+    ls_utils.get_env_var.cache_clear()
+    from langsmith.run_trees import _parse_write_replicas_from_env_var
+
+    _parse_write_replicas_from_env_var.cache_clear()
     mock_session = MagicMock()
     client = Client(session=mock_session, api_key="test", **kwargs)
     return client
@@ -1863,6 +1871,47 @@ def test_attachment_detection_with_string_annotations() -> None:
     assert attachments == {"bar": test_attachment}
 
 
+def test_cached_attachment_args_no_leak() -> None:
+    """Closure funcs passed to _cached_attachment_args should not be retained."""
+    _cached_attachment_args.cache_clear()
+
+    class Ctx:
+        def __init__(self):
+            self.buf = "x" * 1_000_000
+
+    refs = []
+    for _ in range(10):
+        ctx = Ctx()
+        ref = weakref.ref(ctx)
+
+        def closure(ctx=ctx):
+            return len(ctx.buf)
+
+        _cached_attachment_args(inspect.signature(closure), closure)
+        refs.append(ref)
+        del ctx, closure
+
+    gc.collect()
+    alive = sum(1 for r in refs if r() is not None)
+    assert alive == 0, f"{alive}/10 closure contexts still alive"
+    assert len(_attachment_args_cache) == 0
+
+
+def test_cached_attachment_args_non_weakrefable_callable() -> None:
+    _cached_attachment_args.cache_clear()
+
+    class CallableNoWeakref:
+        __slots__ = ()
+
+        def __call__(self, bar: ls_schemas.Attachment) -> ls_schemas.Attachment:
+            return bar
+
+    fn = CallableNoWeakref()
+    signature = inspect.signature(fn)
+    assert _cached_attachment_args(signature, fn) == {"bar"}
+    assert len(_attachment_args_cache) == 0
+
+
 def test_traceable_iterator_process_chunk(mock_client: Client) -> None:
     with tracing_context(enabled=True):
 
@@ -1954,8 +2003,11 @@ def test_set_run_metadata_without_active_run_tree(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     langsmith.set_run_metadata(foo=1)
-    assert len(caplog.records) == 1
-    assert "No active run tree found" in caplog.text
+    run_helper_logs = [
+        record for record in caplog.records if record.name == "langsmith.run_helpers"
+    ]
+    assert len(run_helper_logs) == 1
+    assert "No active run tree found" in run_helper_logs[0].message
 
 
 # Tests for enabled parameter on @traceable decorator
@@ -2268,3 +2320,158 @@ def test_traceable_triple_decorated(mock_client: Client) -> None:
     assert config["tags"] is None
     assert config["metadata"] is None
     assert config["wrapped"] is original_function
+
+
+class TestTraceableExceptionsToHandle:
+    """Tests for the exceptions_to_handle parameter in @traceable decorator."""
+
+    @pytest.mark.parametrize("auto_batch_tracing", [True, False])
+    @pytest.mark.parametrize(
+        "func_type", ["sync", "async", "generator", "async_generator"]
+    )
+    def test_handled_exceptions(self, auto_batch_tracing: bool, func_type: str):
+        """exceptions_to_handle should suppress tracebacks for specified exceptions."""
+        mock_client = _get_mock_client(
+            auto_batch_tracing=auto_batch_tracing,
+            info=ls_schemas.LangSmithInfo(
+                batch_ingest_config=ls_schemas.BatchIngestConfig(
+                    size_limit_bytes=None,
+                    size_limit=100,
+                    scale_up_nthreads_limit=16,
+                    scale_up_qsize_trigger=1000,
+                    scale_down_nempty_trigger=4,
+                )
+            ),
+        )
+
+        if func_type == "sync":
+
+            @traceable(exceptions_to_handle=(ValueError,))
+            def f() -> int:
+                raise ValueError("handled exception")
+
+            def execute():
+                f(langsmith_extra={"client": mock_client})
+
+        elif func_type == "async":
+
+            @traceable(exceptions_to_handle=(ValueError,))
+            async def f() -> int:
+                raise ValueError("handled exception")
+
+            async def execute():
+                await f(langsmith_extra={"client": mock_client})
+
+        elif func_type == "generator":
+
+            @traceable(exceptions_to_handle=(ValueError,))
+            def f():
+                for i in range(3):
+                    yield i
+                raise ValueError("handled exception")
+
+            def execute():
+                for _ in f(langsmith_extra={"client": mock_client}):
+                    pass
+
+        else:  # async_generator
+
+            @traceable(exceptions_to_handle=(ValueError,))
+            async def f():
+                for i in range(3):
+                    yield i
+                raise ValueError("handled exception")
+
+            async def execute():
+                async for _ in f(langsmith_extra={"client": mock_client}):
+                    pass
+
+        with tracing_context(enabled=True):
+            with pytest.raises(ValueError, match="handled exception"):
+                if func_type in ("async", "async_generator"):
+                    asyncio.run(execute())
+                else:
+                    execute()
+
+        num_calls = 1 if auto_batch_tracing else 2
+        mock_calls = _get_calls(
+            mock_client, verbs={"POST", "PATCH", "GET"}, minimum=num_calls
+        )
+        assert len(mock_calls) >= num_calls
+
+        datas = _get_data(mock_calls)
+        for _, payload in datas:
+            if payload.get("error") is not None:
+                pytest.fail(f"Expected error to be None, got: {payload.get('error')}")
+
+    def test_unhandled_exceptions(self):
+        """Test that unhandled exceptions still log tracebacks."""
+        mock_client = _get_mock_client(
+            auto_batch_tracing=True,
+            info=ls_schemas.LangSmithInfo(
+                batch_ingest_config=ls_schemas.BatchIngestConfig(
+                    size_limit_bytes=None,
+                    size_limit=100,
+                    scale_up_nthreads_limit=16,
+                    scale_up_qsize_trigger=1000,
+                    scale_down_nempty_trigger=4,
+                )
+            ),
+        )
+
+        @traceable(exceptions_to_handle=(ValueError,))
+        def f() -> int:
+            raise TypeError("unhandled exception")
+
+        with tracing_context(enabled=True):
+            with pytest.raises(TypeError, match="unhandled exception"):
+                f(langsmith_extra={"client": mock_client})
+
+        # Verify that error is logged with traceback for unhandled exceptions
+        mock_calls = _get_calls(
+            mock_client, verbs={"POST", "PATCH", "GET"}, minimum=1, attempts=20
+        )
+        datas = _get_data(mock_calls)
+        found_error = False
+        for _, payload in datas:
+            if payload.get("error"):
+                found_error = True
+                assert "TypeError" in payload["error"]
+                assert "unhandled exception" in payload["error"]
+        assert found_error, "Expected to find error with traceback in the payloads"
+
+    def test_multiple_exception_types(self, mock_client: Client):
+        """Test that multiple exception types can be handled."""
+
+        @traceable(exceptions_to_handle=(ValueError, TypeError, KeyError))
+        def f(exc_type: str) -> int:
+            if exc_type == "value":
+                raise ValueError("value error")
+            elif exc_type == "type":
+                raise TypeError("type error")
+            elif exc_type == "key":
+                raise KeyError("key error")
+            return 42
+
+        with tracing_context(enabled=True):
+            # All three should be handled
+            with pytest.raises(ValueError):
+                f("value", langsmith_extra={"client": mock_client})
+
+            with pytest.raises(TypeError):
+                f("type", langsmith_extra={"client": mock_client})
+
+            with pytest.raises(KeyError):
+                f("key", langsmith_extra={"client": mock_client})
+
+        # Verify all were handled without traceback
+        mock_calls = _get_calls(mock_client, verbs={"POST", "PATCH"})
+        datas = _get_data(mock_calls)
+
+        for _, payload in datas:
+            # All handled exceptions should not have error field with traceback
+            if payload.get("error") is not None:
+                err = payload.get("error")
+                pytest.fail(
+                    f"Expected error to be None for handled exception, got: {err}"
+                )

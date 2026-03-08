@@ -36,9 +36,12 @@ import langsmith.utils as ls_utils
 from langsmith import AsyncClient, EvaluationResult, aevaluate, evaluate, run_trees
 from langsmith import schemas as ls_schemas
 from langsmith._internal import _orjson
+from langsmith._internal._multipart import MultipartPartsAndContext
 from langsmith._internal._serde import _serialize_json
 from langsmith.client import (
     Client,
+    _apply_auth_overrides,
+    _apply_optional_api_key,
     _construct_url,
     _convert_stored_attachments_to_attachments_dict,
     _dataset_examples_path,
@@ -205,6 +208,56 @@ def test_headers(monkeypatch: pytest.MonkeyPatch) -> None:
 
         client_no_key = Client(api_url="http://localhost:1984")
         assert "x-api-key" not in client_no_key._headers
+
+
+def test_apply_optional_api_key() -> None:
+    headers = {
+        "x-api-key": "old",
+        "X-API-KEY": "old-upper",
+        "other": "value",
+    }
+
+    updated = _apply_optional_api_key(headers, None)
+    assert "x-api-key" not in updated
+    assert "X-API-KEY" not in updated
+    assert updated["other"] == "value"
+
+    updated = _apply_optional_api_key({"other": "value"}, "new-key")
+    assert updated["x-api-key"] == "new-key"
+
+
+def test_apply_auth_overrides() -> None:
+    headers = {
+        "x-api-key": "old",
+        "other": "value",
+    }
+
+    updated = _apply_auth_overrides(
+        headers,
+        api_key=None,
+        service_key=None,
+        tenant_id=None,
+        authorization="Bearer abc",
+        cookie="session=xyz",
+        fallback_api_key="fallback",
+    )
+    assert "x-api-key" not in updated
+    assert updated["Authorization"] == "Bearer abc"
+    assert updated["Cookie"] == "session=xyz"
+    assert updated["other"] == "value"
+
+    updated = _apply_auth_overrides(
+        {"other": "value"},
+        api_key="explicit",
+        service_key="svc",
+        tenant_id="tenant",
+        authorization=None,
+        cookie=None,
+        fallback_api_key="fallback",
+    )
+    assert updated["x-api-key"] == "explicit"
+    assert updated["X-Service-Key"] == "svc"
+    assert updated["X-Tenant-Id"] == "tenant"
 
 
 @mock.patch("langsmith.client.requests.Session")
@@ -1952,6 +2005,96 @@ def test_original_sampling_and_batching():
                 assert i % 2 == 0
 
 
+@pytest.mark.parametrize("method", ["batch_ingest_runs", "multipart_ingest"])
+def test_sampling_before_transform_in_batch_and_multipart(method: str):
+    """Verify that _run_transform is only called for runs that survive sampling.
+
+    When sampling is enabled, runs filtered out should never be transformed
+    (i.e., _run_transform should not be called for them).
+    """
+    mock_session = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_session.request.return_value = mock_response
+
+    sample_count = 0
+
+    def mock_should_sample():
+        nonlocal sample_count
+        sample_count += 1
+        return sample_count % 2 == 1  # Accept 1st, reject 2nd
+
+    with patch(
+        "langsmith.client.Client._should_sample", side_effect=mock_should_sample
+    ):
+        client = Client(
+            api_key="test-api-key",
+            tracing_sampling_rate=0.5,
+            session=mock_session,
+        )
+
+        sampled_trace_id = uuid.uuid4()
+        filtered_trace_id = uuid.uuid4()
+
+        creates = [
+            {
+                "id": sampled_trace_id,
+                "trace_id": sampled_trace_id,
+                "dotted_order": f"20210101T000000000000Z{sampled_trace_id}",
+                "name": "sampled_root",
+                "run_type": "llm",
+                "inputs": {"text": "sampled"},
+                "start_time": "2021-01-01T00:00:00Z",
+            },
+            {
+                "id": filtered_trace_id,
+                "trace_id": filtered_trace_id,
+                "dotted_order": f"20210101T000000000000Z{filtered_trace_id}",
+                "name": "filtered_root",
+                "run_type": "llm",
+                "inputs": {"text": "filtered"},
+                "start_time": "2021-01-01T00:00:00Z",
+            },
+        ]
+
+        updates = [
+            {
+                "id": sampled_trace_id,
+                "trace_id": sampled_trace_id,
+                "dotted_order": f"20210101T000000000000Z{sampled_trace_id}",
+                "outputs": {"result": "sampled output"},
+                "end_time": "2021-01-01T00:00:01Z",
+            },
+            {
+                "id": filtered_trace_id,
+                "trace_id": filtered_trace_id,
+                "dotted_order": f"20210101T000000000000Z{filtered_trace_id}",
+                "outputs": {"result": "filtered output"},
+                "end_time": "2021-01-01T00:00:01Z",
+            },
+        ]
+
+        original_run_transform = Client._run_transform
+        transformed_ids: list[uuid.UUID] = []
+
+        def tracking_transform(self, run, **kwargs):
+            result = original_run_transform(self, run, **kwargs)
+            transformed_ids.append(result["id"])
+            return result
+
+        with patch.object(Client, "_run_transform", tracking_transform):
+            fn = getattr(client, method)
+            fn(create=creates, update=updates)
+
+        # Only the sampled trace should have been transformed
+        assert sampled_trace_id in transformed_ids
+        assert filtered_trace_id not in transformed_ids, (
+            f"{method} called _run_transform on a filtered-out run"
+        )
+        # The sampled trace should appear twice (once for create, once for update)
+        assert transformed_ids.count(sampled_trace_id) == 2
+
+
 @mock.patch("langsmith.client.requests.Session")
 def test_select_eval_results(mock_session_cls: mock.Mock):
     expected = EvaluationResult(
@@ -2914,6 +3057,7 @@ def test_pull_prompt(
         api_key="fake_api_key",
         session=mock_session,
         info=info,
+        disable_prompt_cache=True,
     )
     secrets = {
         "ANTHROPIC_API_KEY": "test_anthropic_key",
@@ -2989,6 +3133,7 @@ def test_pull_and_push_prompt(
         session=mock_session,
         info=info,
         auto_batch_tracing=False,
+        disable_prompt_cache=True,
     )
 
     # Mock the necessary methods for push_prompt and settings
@@ -3562,6 +3707,10 @@ def test_compressed_traces_queue_limit_drops_new_items(
     caplog: pytest.LogCaptureFixture,
 ):
     """Ensure compressed traces queue enforces a max in-memory size and logs drops."""
+    from langsmith.client import _reset_tracing_drop_log
+
+    _reset_tracing_drop_log()
+
     from langsmith._internal._compressed_traces import CompressedTraces
     from langsmith._internal._multipart import MultipartPartsAndContext
     from langsmith._internal._operations import compress_multipart_parts_and_context
@@ -3631,10 +3780,75 @@ def test_compressed_traces_queue_limit_drops_new_items(
 
     # Verify we logged a clear warning about dropping the trace.
     assert any(
-        "Compressed traces queue size limit" in record.getMessage()
-        and "trace=trace2,id=run2" in record.getMessage()
+        "Dropped" in record.getMessage()
+        and "compressed traces buffer full" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_tracing_queue_limit_drops_when_full(
+    caplog: pytest.LogCaptureFixture,
+):
+    """Ensure the uncompressed tracing queue drops items when full."""
+    from langsmith._internal._background_thread import TracingQueueItem
+    from langsmith._internal._operations import SerializedFeedbackOperation
+    from langsmith.client import _reset_tracing_drop_log
+
+    _reset_tracing_drop_log()
+
+    _clear_env_cache()
+    with patch.dict(
+        os.environ,
+        {
+            "LANGSMITH_API_KEY": "test-key",
+            "LANGSMITH_TRACING_QUEUE_MAX_SIZE": "3",
+        },
+        clear=False,
+    ):
+        client = Client(auto_batch_tracing=True)
+
+    assert client.tracing_queue is not None
+    assert client.tracing_queue.maxsize == 3
+
+    def _make_item(priority: str) -> TracingQueueItem:
+        op = SerializedFeedbackOperation(
+            id=uuid.uuid4(), trace_id=uuid.uuid4(), feedback=b"test"
+        )
+        return TracingQueueItem(priority, op)
+
+    # Fill the queue to capacity.
+    client._put_tracing_queue(_make_item("a"))
+    client._put_tracing_queue(_make_item("b"))
+    client._put_tracing_queue(_make_item("c"))
+    assert client.tracing_queue.qsize() == 3
+
+    # This should be dropped with a warning.
+    with caplog.at_level(logging.WARNING):
+        client._put_tracing_queue(_make_item("d"))
+
+    assert client.tracing_queue.qsize() == 3
+    assert any(
+        "Dropped" in record.getMessage() and "tracing queue full" in record.getMessage()
+        for record in caplog.records
+    )
+    client.cleanup()
+
+
+def test_tracing_queue_default_maxsize():
+    """Ensure the default maxsize is applied."""
+    from langsmith._internal._constants import _TRACING_QUEUE_MAX_SIZE
+
+    _clear_env_cache()
+    with patch.dict(
+        os.environ,
+        {"LANGSMITH_API_KEY": "test-key"},
+        clear=False,
+    ):
+        client = Client(auto_batch_tracing=True)
+
+    assert client.tracing_queue is not None
+    assert client.tracing_queue.maxsize == _TRACING_QUEUE_MAX_SIZE
+    client.cleanup()
 
 
 @mock.patch("langsmith.client.requests.Session")
@@ -4389,7 +4603,20 @@ def test_process_buffered_run_ops_advanced_behavior():
             )
 
             # Test fallback behavior
-            client._run_ops_buffer = [("post", {"id": "test", "name": "test_run"})]
+            client._run_ops_buffer = [
+                (
+                    "post",
+                    {"id": "test", "name": "test_run"},
+                    {
+                        "api_url": None,
+                        "api_key": None,
+                        "service_key": None,
+                        "tenant_id": None,
+                        "authorization": None,
+                        "cookie": None,
+                    },
+                )
+            ]
             client._flush_run_ops_buffer()
             mock_process.assert_called_once()
 
@@ -4402,7 +4629,20 @@ def test_process_buffered_run_ops_advanced_behavior():
     )
 
     # Should not flush yet (time not reached)
-    client._run_ops_buffer.append(("post", {"id": "run1", "name": "test"}))
+    client._run_ops_buffer.append(
+        (
+            "post",
+            {"id": "run1", "name": "test"},
+            {
+                "api_url": None,
+                "api_key": None,
+                "service_key": None,
+                "tenant_id": None,
+                "authorization": None,
+                "cookie": None,
+            },
+        )
+    )
     client._run_ops_buffer_last_flush_time = time.time() - 0.5  # 0.5 seconds ago
     assert not client._should_flush_run_ops_buffer()
 
@@ -4414,7 +4654,20 @@ def test_process_buffered_run_ops_advanced_behavior():
     client._run_ops_buffer.clear()
     client._run_ops_buffer_last_flush_time = time.time()  # Recent flush
     for i in range(10):  # Fill to buffer size
-        client._run_ops_buffer.append(("post", {"id": f"run_{i}", "name": "test"}))
+        client._run_ops_buffer.append(
+            (
+                "post",
+                {"id": f"run_{i}", "name": "test"},
+                {
+                    "api_url": None,
+                    "api_key": None,
+                    "service_key": None,
+                    "tenant_id": None,
+                    "authorization": None,
+                    "cookie": None,
+                },
+            )
+        )
     assert client._should_flush_run_ops_buffer()
 
 
@@ -4540,7 +4793,20 @@ def test_process_buffered_run_ops_end_to_end_integration():
                     test_runs.append(run_data)
 
                     with client._run_ops_buffer_lock:
-                        client._run_ops_buffer.append(("post", run_data))
+                        client._run_ops_buffer.append(
+                            (
+                                "post",
+                                run_data,
+                                {
+                                    "api_url": None,
+                                    "api_key": None,
+                                    "service_key": None,
+                                    "tenant_id": None,
+                                    "authorization": None,
+                                    "cookie": None,
+                                },
+                            )
+                        )
                         if client._should_flush_run_ops_buffer():
                             client._flush_run_ops_buffer()
 
@@ -4562,6 +4828,52 @@ def test_process_buffered_run_ops_end_to_end_integration():
                         assert "name" in run
 
                 client.cleanup()
+
+
+def test_run_ops_buffer_preserves_service_auth_overrides():
+    """Buffered run ops must preserve per-op service auth overrides."""
+    import uuid
+
+    def noop(runs):
+        return runs
+
+    client = Client(
+        api_url="https://default.example.com",
+        api_key="default-key",
+        info={"version": "0.0.0"},
+        process_buffered_run_ops=noop,
+        run_ops_buffer_size=100,
+    )
+
+    run_id = uuid.uuid4()
+    client.create_run(
+        id=run_id,
+        name="test",
+        run_type="chain",
+        inputs={"x": 1},
+        trace_id=run_id,
+        dotted_order="20240101T000000000000Z00000000000000000000000000000000",
+        service_key="jwt-token-123",
+        tenant_id="tenant-abc",
+    )
+    assert client._run_ops_buffer, "expected buffered run op"
+    op, _, write_ctx = client._run_ops_buffer[-1]
+    assert op == "post"
+    assert write_ctx["service_key"] == "jwt-token-123"
+    assert write_ctx["tenant_id"] == "tenant-abc"
+
+    client.update_run(
+        run_id,
+        outputs={"y": 2},
+        trace_id=run_id,
+        dotted_order="20240101T000000000000Z00000000000000000000000000000001",
+        service_key="jwt-token-456",
+        tenant_id="tenant-def",
+    )
+    op, _, write_ctx = client._run_ops_buffer[-1]
+    assert op == "patch"
+    assert write_ctx["service_key"] == "jwt-token-456"
+    assert write_ctx["tenant_id"] == "tenant-def"
 
     # Test file closing logic
     files_closed = []
@@ -4958,3 +5270,179 @@ def test_create_project(kwargs, expected_params, expected_body_fields):
         assert "id" in body
         for field, value in expected_body_fields.items():
             assert body[field] == value
+
+
+_MULTIPART_HEADERS = {"Content-Type": "multipart/form-data; boundary=test-boundary"}
+
+
+class TestWriteTraceToFallbackDir:
+    def test_creates_file_with_correct_envelope(self, tmp_path):
+        body = b'--boundary\r\nContent-Disposition: form-data; name="post.abc"\r\n\r\n{}\r\n--boundary--\r\n'
+        Client._write_trace_to_fallback_dir(
+            str(tmp_path),
+            body,
+            endpoint="runs/multipart",
+            headers=_MULTIPART_HEADERS,
+        )
+
+        files = list(tmp_path.iterdir())
+        assert len(files) == 1
+        assert files[0].suffix == ".json"
+
+        envelope = json.loads(files[0].read_text())
+        assert envelope["version"] == 1
+        assert envelope["endpoint"] == "runs/multipart"
+        assert envelope["headers"] == _MULTIPART_HEADERS
+        import base64
+
+        assert base64.b64decode(envelope["body_base64"]) == body
+
+    def test_write_error_is_swallowed(self, tmp_path):
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a dir")
+        Client._write_trace_to_fallback_dir(
+            str(blocker / "sub"),
+            b"{}",
+            endpoint="runs/multipart",
+            headers=_MULTIPART_HEADERS,
+        )
+
+    def test_drops_new_traces_when_over_limit(self, tmp_path):
+        # Each envelope is ~252 bytes on disk.  A budget of 400 bytes allows
+        # the first 2 files (~504 bytes total exceeds 400), so the 3rd write
+        # is dropped because the directory is already over the limit.
+        body = b"x" * 80
+        for _ in range(3):
+            Client._write_trace_to_fallback_dir(
+                str(tmp_path),
+                body,
+                endpoint="runs/multipart",
+                headers=_MULTIPART_HEADERS,
+                max_bytes=400,
+            )
+
+        files = sorted(tmp_path.iterdir())
+        # Only the first 2 files should exist; the 3rd was dropped.
+        assert len(files) == 2
+
+    def test_multipart_failure_writes_envelope(self, tmp_path, monkeypatch):
+        """Integration: a failed multipart upload writes a replayable envelope."""
+        _clear_env_cache()
+        monkeypatch.setenv("LANGSMITH_FAILED_TRACES_DIR", str(tmp_path))
+
+        client = Client(
+            api_url="http://localhost:1984",
+            api_key="test",
+            auto_batch_tracing=False,
+        )
+
+        run_id = uuid.uuid4()
+        run_json = json.dumps(
+            {
+                "id": str(run_id),
+                "name": "test_run",
+                "run_type": "chain",
+                "inputs": {"x": 1},
+                "trace_id": str(run_id),
+                "dotted_order": str(run_id),
+            }
+        ).encode()
+        parts = [
+            (
+                f"post.{run_id}",
+                (
+                    None,
+                    run_json,
+                    "application/json",
+                    {"Content-Length": str(len(run_json))},
+                ),
+            )
+        ]
+
+        acc = MultipartPartsAndContext(parts, f"create run {run_id}")
+
+        # Mock request_with_retries to simulate server error
+        with mock.patch.object(
+            Client,
+            "request_with_retries",
+            side_effect=ls_utils.LangSmithAPIError("Server error"),
+        ):
+            client._send_multipart_req(acc, attempts=1)
+
+        files = list(tmp_path.iterdir())
+        assert len(files) == 1
+
+        envelope = json.loads(files[0].read_text())
+        assert envelope["endpoint"] == "runs/multipart"
+        assert "multipart/form-data" in envelope["headers"]["Content-Type"]
+        # Body decodes to actual multipart bytes containing our run ID
+        import base64
+
+        decoded = base64.b64decode(envelope["body_base64"]).decode()
+        assert str(run_id) in decoded
+
+        _clear_env_cache()
+
+    def test_multipart_success_does_not_write(self, tmp_path, monkeypatch):
+        """Integration: a successful multipart upload writes nothing."""
+        _clear_env_cache()
+        monkeypatch.setenv("LANGSMITH_FAILED_TRACES_DIR", str(tmp_path))
+
+        client = Client(
+            api_url="http://localhost:1984",
+            api_key="test",
+            auto_batch_tracing=False,
+        )
+
+        run_id = uuid.uuid4()
+        run_json = json.dumps(
+            {"id": str(run_id), "name": "test", "run_type": "chain"}
+        ).encode()
+        parts = [
+            (
+                f"post.{run_id}",
+                (
+                    None,
+                    run_json,
+                    "application/json",
+                    {"Content-Length": str(len(run_json))},
+                ),
+            )
+        ]
+        acc = MultipartPartsAndContext(parts, f"create run {run_id}")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = ""
+        mock_response.raise_for_status = MagicMock()
+
+        with mock.patch.object(
+            Client, "request_with_retries", return_value=mock_response
+        ):
+            client._send_multipart_req(acc, attempts=1)
+
+        assert len(list(tmp_path.iterdir())) == 0
+        _clear_env_cache()
+
+    def test_env_var_sets_failed_traces_dir(self, tmp_path, monkeypatch):
+        _clear_env_cache()
+        monkeypatch.setenv("LANGSMITH_FAILED_TRACES_DIR", str(tmp_path))
+        client = Client(
+            api_url="http://localhost:1984",
+            api_key="test",
+            auto_batch_tracing=False,
+        )
+        assert client._failed_traces_dir == str(tmp_path)
+        _clear_env_cache()
+
+    def test_env_var_not_set_leaves_dir_none(self, monkeypatch):
+        _clear_env_cache()
+        monkeypatch.delenv("LANGSMITH_FAILED_TRACES_DIR", raising=False)
+        monkeypatch.delenv("LANGCHAIN_FAILED_TRACES_DIR", raising=False)
+        client = Client(
+            api_url="http://localhost:1984",
+            api_key="test",
+            auto_batch_tracing=False,
+        )
+        assert client._failed_traces_dir is None
+        _clear_env_cache()

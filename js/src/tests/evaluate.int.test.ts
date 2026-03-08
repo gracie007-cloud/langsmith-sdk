@@ -9,6 +9,13 @@ import { Client } from "../index.js";
 import { afterAll, beforeAll } from "@jest/globals";
 import { RunnableLambda, RunnableSequence } from "@langchain/core/runnables";
 import { v4 as uuidv4 } from "uuid";
+
+import * as ai from "ai";
+import { openai } from "@ai-sdk/openai";
+import { wrapAISDK } from "../experimental/vercel/index.js";
+
+const { generateText } = wrapAISDK(ai);
+
 const TESTING_DATASET_NAME = `test_dataset_js_evaluate_${uuidv4()}`;
 const TESTING_DATASET_NAME2 = `my_splits_ds_${uuidv4()}`;
 
@@ -585,6 +592,84 @@ test("max concurrency works with custom evaluators", async () => {
   expect(evalRes.results).toHaveLength(2);
   expect(firstEvalResults.evaluationResults.results).toHaveLength(1);
   expect(receivedCommentStrings).toEqual(expectedCommentStrings);
+});
+
+test("concurrent evaluate restores dataset order before summary", async () => {
+  const client = new Client();
+  const exampleIterator = client.listExamples({
+    datasetName: TESTING_DATASET_NAME,
+  });
+  const examples: Example[] = [];
+  for await (const example of exampleIterator) {
+    examples.push(example);
+  }
+
+  const orderedExamples = examples.sort(
+    (a, b) => Number(a.inputs.input) - Number(b.inputs.input)
+  );
+  const expectedInputs = orderedExamples.map((example) =>
+    Number(example.inputs.input)
+  );
+
+  const targetFunc = async (input: Record<string, any>) => {
+    await new Promise((resolve) =>
+      setTimeout(resolve, input.input === 1 ? 100 : 10)
+    );
+    return {
+      foo: input.input + 1,
+    };
+  };
+
+  const customEvaluator = async (run: Run, example?: Example) => {
+    await new Promise((resolve) =>
+      setTimeout(resolve, Number(example?.inputs.input) === 1 ? 10 : 100)
+    );
+    return {
+      key: "paired",
+      score:
+        run.outputs?.foo === Number(example?.inputs.input ?? Number.NaN) + 1
+          ? 1
+          : 0,
+      comment: `input:${example?.inputs.input}`,
+    };
+  };
+
+  const inputOrderSummaryEvaluator = ({
+    inputs,
+  }: {
+    inputs?: Record<string, any>[];
+  }): EvaluationResult => {
+    return {
+      key: "input_order",
+      score: 1,
+      comment: (inputs ?? []).map((input) => input.input).join(","),
+    };
+  };
+
+  const evalRes = await evaluate(targetFunc, {
+    data: orderedExamples,
+    evaluators: [customEvaluator],
+    summaryEvaluators: [inputOrderSummaryEvaluator],
+    targetConcurrency: 2,
+    evaluationConcurrency: 2,
+    description:
+      "concurrent evaluate restores dataset order before summary integration test",
+  });
+
+  expect(
+    evalRes.results.map(({ example }) => Number(example.inputs.input))
+  ).toEqual(expectedInputs);
+  expect(evalRes.results.map(({ run }) => run.outputs?.foo)).toEqual(
+    expectedInputs.map((input) => input + 1)
+  );
+  expect(
+    evalRes.results.map(
+      ({ evaluationResults }) => evaluationResults.results[0].comment
+    )
+  ).toEqual(expectedInputs.map((input) => `input:${input}`));
+  expect(evalRes.summaryResults.results[0].comment).toBe(
+    expectedInputs.join(",")
+  );
 });
 
 test("max concurrency works with summary evaluators", async () => {
@@ -1232,4 +1317,23 @@ test("evaluate enforces correct evaluator types for comparative evaluation at ru
       description: "Should fail at runtime",
     })
   ).rejects.toThrow(); // You might want to be more specific about the error message
+});
+
+test("evaluate succeeds with child runs that take a while to resolve", async () => {
+  const target = async () => {
+    void generateText({
+      prompt: "Hello world",
+      model: openai("gpt-5-nano"),
+    });
+    return { foo: "foo" };
+  };
+  const res = await evaluate(target, {
+    data: TESTING_DATASET_NAME,
+  });
+  expect(res.results.length).toEqual(2);
+  for (const result of res.results) {
+    // This check is important to ensure the output is set before child promises resolve
+    // for AI SDK
+    expect(result.run.outputs).toEqual({ foo: "foo" });
+  }
 });

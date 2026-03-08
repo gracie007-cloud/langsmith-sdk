@@ -63,7 +63,7 @@ type PatchedAnthropicClient<T extends AnthropicType> = T & {
 /**
  * Create usage metadata from Anthropic's token usage format.
  */
-function createUsageMetadata(
+export function createUsageMetadata(
   anthropicUsage: Partial<Anthropic.Messages.Usage>
 ): KVMap | undefined {
   if (!anthropicUsage) {
@@ -78,7 +78,6 @@ function createUsageMetadata(
     typeof anthropicUsage.output_tokens === "number"
       ? anthropicUsage.output_tokens
       : 0;
-  const totalTokens = inputTokens + outputTokens;
 
   const inputTokenDetails: Record<string, number> =
     convertAnthropicUsageToInputTokenDetails(
@@ -86,10 +85,19 @@ function createUsageMetadata(
       anthropicUsage as Record<string, any>
     );
 
+  // Anthropic cache tokens are ADDITIVE (not subsets of input_tokens like OpenAI).
+  // Sum them into input_tokens so the backend cost calculation is correct.
+  const cacheTokenSum = Object.values(inputTokenDetails).reduce(
+    (sum, v) => sum + (v ?? 0),
+    0
+  );
+  const adjustedInputTokens = inputTokens + cacheTokenSum;
+  const adjustedTotalTokens = adjustedInputTokens + outputTokens;
+
   return {
-    input_tokens: inputTokens,
+    input_tokens: adjustedInputTokens,
     output_tokens: outputTokens,
-    total_tokens: totalTokens,
+    total_tokens: adjustedTotalTokens,
     ...(Object.keys(inputTokenDetails).length > 0 && {
       input_token_details: inputTokenDetails,
     }),
@@ -314,6 +322,41 @@ export const wrapAnthropic = <T extends AnthropicType>(
     metadata: restMetadata,
   };
 
+  /**
+   * Transform system parameter into visible message for playground editability.
+   * This provides parity with the Python SDK behavior and enables system prompts
+   * to be viewed and edited in the LangSmith playground.
+   */
+  function processSystemMessage(
+    params: Record<string, unknown>
+  ): Record<string, unknown> {
+    if (!params.system) {
+      return params;
+    }
+
+    const processed = { ...params };
+
+    // Handle both string and ContentBlock[] formats
+    const systemContent = Array.isArray(params.system)
+      ? params.system
+          .map((block: string | { text: string; type?: string }) =>
+            typeof block === "string" ? block : block.text
+          )
+          .join("\n")
+      : params.system;
+
+    // Transform into first message
+    processed.messages = [
+      { role: "system" as const, content: systemContent },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ...((params as any).messages || []),
+    ];
+
+    delete processed.system;
+
+    return processed;
+  }
+
   // Common configuration for messages.create
   const messagesCreateConfig: TraceableConfig<
     typeof anthropic.messages.create
@@ -322,6 +365,7 @@ export const wrapAnthropic = <T extends AnthropicType>(
     run_type: "llm",
     aggregator: messageAggregator,
     argsConfigPath: [1, "langsmithExtra"],
+    processInputs: processSystemMessage,
     getInvocationParams: (payload: unknown) => {
       if (typeof payload !== "object" || payload == null) return undefined;
       const params = payload as Anthropic.MessageCreateParams;
@@ -405,6 +449,7 @@ export const wrapAnthropic = <T extends AnthropicType>(
       run_type: "llm",
       aggregator: messageAggregator,
       argsConfigPath: [1, "langsmithExtra"],
+      processInputs: processSystemMessage,
       getInvocationParams: messagesCreateConfig.getInvocationParams,
       processOutputs: processMessageOutput,
       ...cleanedOptions,
@@ -441,6 +486,7 @@ export const wrapAnthropic = <T extends AnthropicType>(
           run_type: "llm",
           aggregator: messageAggregator,
           argsConfigPath: [1, "langsmithExtra"],
+          processInputs: processSystemMessage,
           getInvocationParams: messagesCreateConfig.getInvocationParams,
           processOutputs: processMessageOutput,
           ...cleanedOptions,
